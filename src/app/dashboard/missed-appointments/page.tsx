@@ -22,8 +22,8 @@ interface Appointment {
     appointmentType?: string;
     serviceType?: string;
     referenceNos?: string[];
-    receipts?: { id?: string; referenceNo?: string; customerId?: string; customerName?: string }[];
-    loads?: { id?: string; loadNo?: string; customerId?: string; customerName?: string }[];
+    receipts?: { id?: string; referenceNo?: string; customerId?: string; customerName?: string; status?: string; receiptStatus?: string }[];
+    loads?: { id?: string; loadNo?: string; customerId?: string; customerName?: string; status?: string; loadStatus?: string; orderStatus?: string; shipmentStatus?: string }[];
   }[];
 }
 
@@ -42,25 +42,79 @@ function timeSince(d: string): { label: string; hours: number; days: number } {
   return { label: `${Math.round(ms / 60000)} min`, hours, days };
 }
 
+const FINAL_PARENT_STATUS_WORDS = [
+  "SHIPPED", "COMPLETED", "COMPLETE", "CLOSED", "CANCELLED", "CANCELED",
+  "VOID", "DELIVERED", "SHORT_SHIPPED", "SHORTSHIPPED", "FINALIZED",
+];
+const RESOLVED_APPT_STATUS_WORDS = [
+  "COMPLETED", "COMPLETE", "CONFIRMED_ARRIVED", "CONFIRMEDARRIVED", "CHECKED_IN", "CHECKEDIN",
+  "IN_PROGRESS", "INPROGRESS", "ARRIVED", "CONFIRM", "CONFIRMED", "CANCELLED", "CANCELED", "CLOSED",
+];
+
+function normStatus(v?: string) { return (v || "").replace(/[\s-]/g, "_").toUpperCase(); }
+function isFinalStatus(v?: string) {
+  const n = normStatus(v).replace(/_/g, "");
+  return FINAL_PARENT_STATUS_WORDS.some(s => n === s.replace(/_/g, "") || n.includes(s.replace(/_/g, "")));
+}
+function isResolvedAppointmentStatus(v?: string) {
+  const n = normStatus(v).replace(/_/g, "");
+  return RESOLVED_APPT_STATUS_WORDS.some(s => n === s.replace(/_/g, "") || n.includes(s.replace(/_/g, "")));
+}
+function getParentStatusValues(appt: Appointment): string[] {
+  const values: string[] = [];
+  const anyAppt = appt as unknown as Record<string, unknown>;
+  ["orderStatus", "loadStatus", "shipmentStatus", "status", "statusDesc", "outboundStatus"].forEach(k => {
+    const v = anyAppt[k]; if (typeof v === "string") values.push(v);
+  });
+  for (const action of appt.appointmentActions || []) {
+    const anyAction = action as unknown as Record<string, unknown>;
+    ["orderStatus", "loadStatus", "shipmentStatus", "status", "statusDesc", "outboundStatus"].forEach(k => {
+      const v = anyAction[k]; if (typeof v === "string") values.push(v);
+    });
+    for (const load of action.loads || []) [load.status, load.loadStatus, load.orderStatus, load.shipmentStatus].forEach(v => { if (v) values.push(v); });
+    for (const receipt of action.receipts || []) [receipt.status, receipt.receiptStatus].forEach(v => { if (v) values.push(v); });
+  }
+  return values;
+}
+function hasFinalParentStatus(appt: Appointment) { return getParentStatusValues(appt).some(isFinalStatus); }
+function getAppointmentRefs(appt: Appointment): string[] {
+  const refs = new Set<string>();
+  const add = (v?: string) => { if (v) refs.add(v.trim().toUpperCase()); };
+  add(appt.id); add(appt.sid); add(appt.preCheckNo);
+  for (const action of appt.appointmentActions || []) {
+    action.referenceNos?.forEach(add);
+    action.loads?.forEach(l => { add(l.loadNo); add(l.id); });
+    action.receipts?.forEach(r => { add(r.referenceNo); add(r.id); });
+  }
+  return [...refs].filter(Boolean);
+}
+function getOrderRefs(order: Record<string, unknown>): string[] {
+  const refs = new Set<string>();
+  const add = (v: unknown) => { if (typeof v === "string" && v.trim()) refs.add(v.trim().toUpperCase()); };
+  ["id", "orderNo", "orderNumber", "referenceNo", "poNo", "loadNo", "bolNo", "containerNo", "trackingNo", "dnNo"].forEach(k => add(order[k]));
+  const arrays = [order.soNos, order.referenceNos, order.dnNos, order.loadNos];
+  arrays.forEach(arr => Array.isArray(arr) && arr.forEach(add));
+  return [...refs];
+}
+
 function getApptStatus(appt: Appointment): { label: string; cls: string; badge: string } {
   const scheduled = appt.appointmentTime ? new Date(appt.appointmentTime) : null;
   if (!scheduled) return { label: "Unknown", cls: "", badge: "" };
 
   const now = Date.now();
-  const status = (appt.apptStatus || "").toUpperCase();
+  const status = appt.apptStatus || "";
 
-  if (status === "COMPLETED" || status === "CHECKED_IN" || status === "CONFIRM") {
-    if (appt.startTime && scheduled) {
-      const arrival = new Date(appt.startTime);
-      if (arrival > scheduled) return { label: "Late", cls: "status-late", badge: "🟡" };
-    }
-    return { label: "On Time", cls: "status-ontime", badge: "🟢" };
+  if (hasFinalParentStatus(appt) || isFinalStatus(status)) {
+    return { label: "Closed", cls: "status-ontime", badge: "🟢" };
+  }
+  if (isResolvedAppointmentStatus(status)) {
+    if (normStatus(status).includes("CANCEL")) return { label: "Cancelled", cls: "status-scheduled", badge: "" };
+    return { label: normStatus(status).includes("IN_PROGRESS") || normStatus(status).includes("CHECKED") ? "In Progress" : "Confirmed", cls: "status-ontime", badge: "🟢" };
   }
 
-  if (scheduled.getTime() < now) {
-    return { label: "Missed Appointment", cls: "status-missed", badge: "🔴" };
-  }
-
+  const msSincePast = now - scheduled.getTime();
+  if (msSincePast > 60 * 60 * 1000) return { label: "Missed Appointment", cls: "status-missed", badge: "🔴" };
+  if (msSincePast > 0) return { label: "In Progress", cls: "status-late", badge: "🟡" };
   return { label: "Scheduled", cls: "status-scheduled", badge: "" };
 }
 
@@ -397,14 +451,39 @@ export default function MissedAppointmentsPage() {
 
   // Live refresh interval (45 seconds default)
   const REFRESH_INTERVAL_MS = 45000;
+  const OPEN_ORDER_STATUSES = [
+    "IMPORTED", "OPEN", "PARTIAL_COMMITTED", "COMMIT_BLOCKED", "COMMIT_FAILED",
+    "COMMITTED", "PLANNING", "PLANNED", "PICKING", "PICKED", "READY_TO_SHIP",
+    "PACKING", "PACKED", "STAGED", "LOADING", "LOADED", "REOPEN", "EXCEPTION",
+    "PARTIAL_SHIPPED", "BLOCKED", "ON_HOLD",
+  ];
 
   const load = useCallback(async () => {
     if (!token) return;
     setLoading(true); setError(""); setStale(false);
     try {
-      const json = await wmsProxy(token, "/wms-bam/appointment/search-by-paging", { currentPage: 1, pageSize: 200 });
-      if (!json?.success) throw new Error("Appointment data could not be loaded.");
-      setAppointments(json.data?.list || []);
+      const [apptJson, openOrdersJson] = await Promise.all([
+        wmsProxy(token, "/wms-bam/appointment/search-by-paging", { currentPage: 1, pageSize: 500 }),
+        // Delta appointment refresh is not exposed by the verified WMS endpoint; refresh the current live page and cross-check outbound appointments against open orders.
+        wmsProxy(token, "/wms-bam/outbound/order/search-by-paging", { currentPage: 1, pageSize: 2000, statuses: OPEN_ORDER_STATUSES }).catch(() => null),
+      ]);
+      if (!apptJson?.success) throw new Error("Appointment data could not be loaded.");
+      const raw: Appointment[] = apptJson.data?.list || [];
+      const openOrderRefs = new Set<string>();
+      const openOrders = openOrdersJson?.data?.list || [];
+      openOrders.forEach((order: Record<string, unknown>) => getOrderRefs(order).forEach(ref => openOrderRefs.add(ref)));
+
+      const active = raw.filter(a => {
+        if (hasFinalParentStatus(a) || isFinalStatus(a.apptStatus) || isResolvedAppointmentStatus(a.apptStatus)) return false;
+        const type = (a.appointmentType || "").toUpperCase();
+        const refs = getAppointmentRefs(a);
+        // For outbound appointments, remove rows whose DN/load/order reference is no longer in the open-order set.
+        // If WMS does not provide parent refs, keep the row and rely on appointment/parent status fields above.
+        if (type === "OUTBOUND" && openOrderRefs.size > 0 && refs.length > 0) return refs.some(ref => openOrderRefs.has(ref));
+        return true;
+      });
+      const unique = Array.from(new Map(active.map(a => [a.id || getAppointmentRefs(a).join("|"), a])).values());
+      setAppointments(unique);
       setLastUpdated(new Date().toLocaleString("en-US", { timeZone: "America/New_York", month: "2-digit", day: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" }));
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "Unable to retrieve the latest appointment data. Retrying...");
@@ -580,8 +659,12 @@ export default function MissedAppointmentsPage() {
       </div>
 
       {/* Filters */}
-      <h2 style={{ marginTop: 24 }}>Appointment Details</h2>
-      <div style={{ display: "flex", gap: 8, margin: "16px 0 10px", flexWrap: "wrap", alignItems: "center" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 24, flexWrap: "wrap" }}>
+        <h2 style={{ margin: 0 }}>Appointment Details</h2>
+        <span style={{ fontSize: 10, padding: "3px 8px", borderRadius: 999, border: "1px solid #2f4368", color: "#9fb3d9", background: "#111c30" }}>Excludes closed orders</span>
+      </div>
+      <p style={{ margin: "6px 0 10px", fontSize: 11, color: "#8899b4" }}>Missed = scheduled time passed by more than 1 hour, appointment not completed/arrived/cancelled, and order/load still open.</p>
+      <div style={{ display: "flex", gap: 8, margin: "10px 0 10px", flexWrap: "wrap", alignItems: "center" }}>
         <input type="text" placeholder="Customer" value={customerFilter} onChange={e => setCustomerFilter(e.target.value)} className="filter-input" />
         <input type="text" placeholder="Carrier" value={carrierFilter} onChange={e => setCarrierFilter(e.target.value)} className="filter-input" />
         <select value={typeFilter} onChange={e => setTypeFilter(e.target.value as typeof typeFilter)} className="filter-select">
