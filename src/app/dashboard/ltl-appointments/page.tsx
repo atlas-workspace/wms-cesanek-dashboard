@@ -551,9 +551,17 @@ export default function LtlAppointmentsPage() {
       {/* Notification drafts note */}
       {Object.values(ltlState).some(s => s.notificationDraft === "pending") && (
         <div style={{ marginTop: 16, padding: 12, background: "#1e1b4b", border: "1px solid #5539f6", borderRadius: 8 }}>
-          <p style={{ margin: 0, fontSize: 12, color: "#c7d2fe" }}>
-            Rolled-over appointments have pending notification drafts. Visit <a href="/dashboard/notifications" style={{ color: "#a99cff" }}>Notifications</a> to send Missed LTL Appointment or LTL Appointment Rolled Over communications.
+          <p style={{ margin: "0 0 6px", fontSize: 12, color: "#c7d2fe" }}>
+            Rolled-over appointments have pending notification drafts.
           </p>
+          <p style={{ margin: "0 0 8px", fontSize: 11, color: "#9aa8c7" }}>
+            Test notification recipient: <b style={{ color: "#eaf0ff" }}>erin.cambra@unisco.com</b> · Email automation in Draft/Test Mode — no emails are auto-sent.
+          </p>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <a href={`mailto:erin.cambra@unisco.com?subject=${encodeURIComponent("Your LTL Pickup Appointment Has Been Automatically Rescheduled")}&body=${encodeURIComponent("Hello,\n\nYour shipment has automatically been rescheduled after today's pickup window closed.\n\nShipment Details:\n• Order Number: [See rolled orders above]\n• Load Number: —\n• Carrier: —\n• Original Pickup: —\n• New Pickup: Next business day 8:00 AM ET\n\nNo action is required from you.\n\nIf you have questions, please contact Customer Service.\n\nThank you.")}`} className="panel-btn primary" style={{ textDecoration: "none", fontSize: 11 }}>Open Customer Email Draft</a>
+            <a href={`mailto:erin.cambra@unisco.com?subject=${encodeURIComponent("[Internal] LTL Missed Pickup Auto-Rollover — Cesanek LT_F21")}&body=${encodeURIComponent("Internal Notification — LTL Auto-Rollover\n\nFacility: Cesanek LT_F21\nTriggered By: System Automation\nReason: Missed Pickup Auto Rollover (4:00 PM cutoff)\n\nRolled appointments require review.\n\nRecipients: Transportation Planning, Warehouse Operations, Customer Service, Dispatch")}`} className="panel-btn" style={{ textDecoration: "none", fontSize: 11 }}>Open Internal Email Draft</a>
+            <a href="/dashboard/notifications" className="panel-btn" style={{ textDecoration: "none", fontSize: 11 }}>Use Templates →</a>
+          </div>
         </div>
       )}
 
