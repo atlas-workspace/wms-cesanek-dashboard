@@ -225,6 +225,14 @@ export default function SlaPage() {
   const [editingAppt, setEditingAppt] = useState<string | null>(null);
   const [editValue, setEditValue] = useState("");
   const [selectedOrder, setSelectedOrder] = useState<SlaOrder | null>(null);
+  const [lastUpdated, setLastUpdated] = useState("");
+  const [stale, setStale] = useState(false);
+
+  // --- Live WMS Sync Configuration ---
+  // Auto-refresh every 10 minutes. Preserves filters, sort, page, expanded rows.
+  // Reusable pattern for Appointment Management, LTL, Carrier Performance,
+  // Warehouse Capacity, Customer Notifications, Exception Management, Executive KPIs.
+  const SYNC_INTERVAL_MS = 600000; // 10 minutes
 
   useEffect(() => { const i = setInterval(() => setTick(t => t + 1), 30000); return () => clearInterval(i); }, []);
   useEffect(() => {
@@ -247,7 +255,8 @@ export default function SlaPage() {
   }, []);
 
   async function load() {
-    setLoading(true); setError("");
+    setLoading(true);
+    const startMs = Date.now();
     try {
       if (!token) { setError("Please sign in to view SLA data."); setLoading(false); return; }
       const cutoffMs = threeMonthsAgo();
@@ -267,11 +276,37 @@ export default function SlaPage() {
         pg++;
       }
 
-      setOrders(all.filter(o => o.createdTime && new Date(o.createdTime).getTime() >= cutoffMs));
-    } catch (e: unknown) { setError(e instanceof Error ? e.message : "Unable to load SLA data."); } finally { setLoading(false); }
+      // Client-side 3-month filter; deduplicate by order id
+      const seen = new Set<string>();
+      const deduplicated = all.filter(o => {
+        if (!o.createdTime || new Date(o.createdTime).getTime() < cutoffMs) return false;
+        if (seen.has(o.id)) return false;
+        seen.add(o.id);
+        return true;
+      });
+
+      setOrders(deduplicated);
+      setError("");
+      setStale(false);
+      setLastUpdated(new Date().toLocaleTimeString("en-US", { timeZone: "America/New_York", hour: "numeric", minute: "2-digit", second: "2-digit" }));
+      // Internal sync log (developer console only)
+      const elapsed = Date.now() - startMs;
+      console.info(`[SLA Sync] ${deduplicated.length} records · ${elapsed}ms · ${pg - 1} pages`);
+    } catch (e: unknown) {
+      // Keep last successful data visible; show non-intrusive warning
+      setStale(true);
+      if (orders.length === 0) setError(e instanceof Error ? e.message : "Unable to load SLA data.");
+    } finally { setLoading(false); }
   }
 
   useEffect(() => { if (token) load(); }, [token]);
+
+  // Auto-refresh every 10 minutes — preserves filters, sort, page, expanded rows
+  useEffect(() => {
+    if (!token) return;
+    const interval = setInterval(() => { load(); }, SYNC_INTERVAL_MS);
+    return () => clearInterval(interval);
+  }, [token]);
 
   // Filtering
   const filtered = useMemo(() => {
@@ -365,11 +400,14 @@ export default function SlaPage() {
       </div>
 
       {error && <div className="notice">{error}</div>}
+      {stale && !error && <div style={{ fontSize: 11, color: "#facc15", margin: "4px 0" }}>⚠ Live sync temporarily unavailable — showing last successful data. Retrying automatically.</div>}
       <div className="actions">
-        <button onClick={load} disabled={loading}>{loading ? "Loading..." : "Refresh"}</button>
+        <button onClick={load} disabled={loading}>{loading ? "Syncing..." : "Refresh"}</button>
         <button onClick={() => setCurrentPage(Math.max(1, currentPage - 1))} disabled={currentPage <= 1}>Previous</button>
         <button onClick={() => setCurrentPage(Math.min(totalPages, currentPage + 1))} disabled={currentPage >= totalPages}>Next</button>
         <span style={{ color: "#64748b", fontSize: 12, marginLeft: 8 }}>Page {currentPage} of {totalPages} · {filtered.length} orders (last 90 days)</span>
+        {lastUpdated && <span style={{ fontSize: 10, color: "#64748b", marginLeft: 8 }}>Last Updated: {lastUpdated}</span>}
+        <span style={{ fontSize: 10, color: stale ? "#facc15" : "#4ade80", marginLeft: 4 }}>{stale ? "● Retrying" : "● Live (10m sync)"}</span>
       </div>
 
       {/* Table */}
