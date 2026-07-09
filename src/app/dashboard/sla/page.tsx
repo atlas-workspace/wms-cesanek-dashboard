@@ -320,15 +320,80 @@ export default function SlaPage() {
     });
   }, [orders, statusFilter, customerSearch, rnSearch, dnSearch, carrierSearch]);
 
-  // Sort oldest first
+  // --- Sortable columns ---
+  type SortCol = "customer" | "rn" | "dn" | "load" | "po" | "type" | "created" | "deadline" | "slaStatus" | "appointment" | "apptStatus" | "carrier" | "pallets" | "weight";
+  type SortDir = "asc" | "desc" | null;
+  const [sortCol, setSortCol] = useState<SortCol | null>(null);
+  const [sortDir, setSortDir] = useState<SortDir>(null);
+
+  const handleSort = useCallback((col: SortCol) => {
+    if (sortCol !== col) { setSortCol(col); setSortDir("asc"); }
+    else if (sortDir === "asc") { setSortDir("desc"); }
+    else { setSortCol(null); setSortDir(null); } // third click clears
+  }, [sortCol, sortDir]);
+
+  function sortIndicator(col: SortCol) {
+    if (sortCol !== col) return <span style={{ opacity: 0.3, marginLeft: 3 }}>▲▼</span>;
+    return <span style={{ marginLeft: 3 }}>{sortDir === "asc" ? "▲" : "▼"}</span>;
+  }
+
+  // SLA status priority for sorting (lower = more urgent)
+  function slaPriority(o: SlaOrder): number {
+    const ea = localAppts[o.id] || o.appointmentTime;
+    const sla = getSlaStatus(o.createdTime, ea);
+    switch (sla.category) {
+      case "critical": return 0;
+      case "approaching": return 1;
+      case "overdue": case "appt-missed": return 2;
+      case "scheduled": case "appt-soon": return 4;
+      default: return 3; // healthy/missing
+    }
+  }
+
+  // Appointment status priority for sorting
+  function apptPriority(o: SlaOrder): number {
+    const ea = localAppts[o.id] || o.appointmentTime;
+    if (!ea) return 0; // Missing
+    const diff = new Date(ea).getTime() - Date.now();
+    if (diff < -3600000) return 1; // Missed
+    if (diff > 0) return 2; // Scheduled/Soon
+    return 3; // In Progress / Completed
+  }
+
+  // Sort: if user column sort active, use it; otherwise default oldest-first
   const sorted = useMemo(() => {
     void tick;
-    return [...filtered].sort((a, b) => {
-      const tA = a.createdTime ? new Date(a.createdTime).getTime() : Infinity;
-      const tB = b.createdTime ? new Date(b.createdTime).getTime() : Infinity;
-      return tA - tB;
+    const arr = [...filtered];
+    if (!sortCol || !sortDir) {
+      // Default: oldest created first
+      return arr.sort((a, b) => {
+        const tA = a.createdTime ? new Date(a.createdTime).getTime() : Infinity;
+        const tB = b.createdTime ? new Date(b.createdTime).getTime() : Infinity;
+        return tA - tB;
+      });
+    }
+    const dir = sortDir === "asc" ? 1 : -1;
+    return arr.sort((a, b) => {
+      let cmp = 0;
+      switch (sortCol) {
+        case "customer": cmp = (a.customerName || a.customerCode || "").localeCompare(b.customerName || b.customerCode || "", undefined, { sensitivity: "base" }); break;
+        case "rn": cmp = (a.bolNo || "").localeCompare(b.bolNo || "", undefined, { sensitivity: "base" }); break;
+        case "dn": cmp = (a.referenceNo || a.id || "").localeCompare(b.referenceNo || b.id || "", undefined, { sensitivity: "base" }); break;
+        case "load": cmp = (a.loadNo || "").localeCompare(b.loadNo || "", undefined, { sensitivity: "base" }); break;
+        case "po": cmp = (a.poNo || "").localeCompare(b.poNo || "", undefined, { sensitivity: "base" }); break;
+        case "type": cmp = (a.orderType || "").localeCompare(b.orderType || "", undefined, { sensitivity: "base" }); break;
+        case "created": cmp = (a.createdTime ? new Date(a.createdTime).getTime() : 0) - (b.createdTime ? new Date(b.createdTime).getTime() : 0); break;
+        case "deadline": cmp = (a.createdTime ? slaDeadline(a.createdTime).getTime() : 0) - (b.createdTime ? slaDeadline(b.createdTime).getTime() : 0); break;
+        case "slaStatus": cmp = slaPriority(a) - slaPriority(b); break;
+        case "appointment": { const ea = localAppts[a.id] || a.appointmentTime; const eb = localAppts[b.id] || b.appointmentTime; cmp = (ea ? new Date(ea).getTime() : Infinity) - (eb ? new Date(eb).getTime() : Infinity); break; }
+        case "apptStatus": cmp = apptPriority(a) - apptPriority(b); break;
+        case "carrier": cmp = (a.carrierName || a.carrierId || "").localeCompare(b.carrierName || b.carrierId || "", undefined, { sensitivity: "base" }); break;
+        case "pallets": cmp = (a.totalPallets ?? 0) - (b.totalPallets ?? 0); break;
+        case "weight": cmp = (a.totalWeight ?? 0) - (b.totalWeight ?? 0); break;
+      }
+      return cmp * dir;
     });
-  }, [filtered, tick]);
+  }, [filtered, sortCol, sortDir, localAppts, tick]);
 
   // Pagination
   const totalPages = Math.ceil(sorted.length / pageSize);
@@ -416,20 +481,20 @@ export default function SlaPage() {
           <thead>
             <tr>
               <th style={{ width: 24 }}></th>
-              <th>Customer</th>
-              <th>RN</th>
-              <th>DN / Order #</th>
-              <th>Load #</th>
-              <th>PO / Ref</th>
-              <th>Type</th>
-              <th>Created</th>
-              <th>SLA Deadline</th>
-              <th>SLA Status</th>
-              <th>Appointment</th>
-              <th>Appt Status</th>
-              <th>Carrier</th>
-              <th>Pallets</th>
-              <th>Weight</th>
+              <th style={{ cursor: "pointer" }} onClick={() => handleSort("customer")}>Customer{sortIndicator("customer")}</th>
+              <th style={{ cursor: "pointer" }} onClick={() => handleSort("rn")}>RN{sortIndicator("rn")}</th>
+              <th style={{ cursor: "pointer" }} onClick={() => handleSort("dn")}>DN / Order #{sortIndicator("dn")}</th>
+              <th style={{ cursor: "pointer" }} onClick={() => handleSort("load")}>Load #{sortIndicator("load")}</th>
+              <th style={{ cursor: "pointer" }} onClick={() => handleSort("po")}>PO / Ref{sortIndicator("po")}</th>
+              <th style={{ cursor: "pointer" }} onClick={() => handleSort("type")}>Type{sortIndicator("type")}</th>
+              <th style={{ cursor: "pointer" }} onClick={() => handleSort("created")}>Created{sortIndicator("created")}</th>
+              <th style={{ cursor: "pointer" }} onClick={() => handleSort("deadline")}>SLA Deadline{sortIndicator("deadline")}</th>
+              <th style={{ cursor: "pointer" }} onClick={() => handleSort("slaStatus")}>SLA Status{sortIndicator("slaStatus")}</th>
+              <th style={{ cursor: "pointer" }} onClick={() => handleSort("appointment")}>Appointment{sortIndicator("appointment")}</th>
+              <th style={{ cursor: "pointer" }} onClick={() => handleSort("apptStatus")}>Appt Status{sortIndicator("apptStatus")}</th>
+              <th style={{ cursor: "pointer" }} onClick={() => handleSort("carrier")}>Carrier{sortIndicator("carrier")}</th>
+              <th style={{ cursor: "pointer" }} onClick={() => handleSort("pallets")}>Pallets{sortIndicator("pallets")}</th>
+              <th style={{ cursor: "pointer" }} onClick={() => handleSort("weight")}>Weight{sortIndicator("weight")}</th>
             </tr>
           </thead>
           <tbody>
