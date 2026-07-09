@@ -76,19 +76,26 @@ function getNextBusinessDay(from: Date): Date {
   return next;
 }
 
+// 4:00 PM ET is the daily pickup cutoff
+function isPastCutoff(): boolean {
+  const now = new Date();
+  const estNow = new Date(now.toLocaleString("en-US", { timeZone: "America/New_York" }));
+  return estNow.getHours() >= 16;
+}
+
 function calculateRolloverTime(missedAppt: string): string {
-  const missed = new Date(missedAppt);
   const now = new Date();
   const estNow = new Date(now.toLocaleString("en-US", { timeZone: "America/New_York" }));
   const hour = estNow.getHours();
 
-  if (hour < 12) {
-    // Roll to same-day afternoon
-    const sameDay = new Date(missed);
-    sameDay.setHours(14, 0, 0, 0);
-    if (sameDay.getTime() > now.getTime()) return sameDay.toISOString();
+  // After 4:00 PM cutoff or after noon: always next business day
+  if (hour >= 16 || hour >= 12) {
+    return getNextBusinessDay(now).toISOString();
   }
-  // Roll to next business day morning
+  // Before noon: try same-day afternoon slot
+  const sameDay = new Date(now);
+  sameDay.setHours(14, 0, 0, 0);
+  if (sameDay.getTime() > now.getTime()) return sameDay.toISOString();
   return getNextBusinessDay(now).toISOString();
 }
 
@@ -164,7 +171,7 @@ export default function LtlAppointmentsPage() {
   const [statusFilterVal, setStatusFilterVal] = useState("");
   const [rolloverFilter, setRolloverFilter] = useState("");
 
-  const REFRESH_INTERVAL_MS = 45000;
+  const REFRESH_INTERVAL_MS = 600000; // 10 minutes
 
   useEffect(() => { setLtlState(loadLtlState()); }, []);
 
@@ -209,39 +216,48 @@ export default function LtlAppointmentsPage() {
     return () => { clearInterval(dataInterval); clearInterval(tickInterval); };
   }, [load]);
 
-  // Auto-rollover check
+  // Auto-rollover check — triggers after 4:00 PM ET cutoff or when >1h past appointment
   useEffect(() => {
     void tick;
+    const pastCutoff = isPastCutoff();
+    const today = new Date().toDateString();
     orders.forEach(o => {
+      if (!o.appointmentTime) return; // No-appointment orders hidden from main view
       const state = ltlState[o.id];
       const effectiveAppt = state?.apptOverride || o.appointmentTime;
       if (!effectiveAppt) return;
-      if (state?.status === "Complete" || state?.status === "Confirmed") return;
-      if (isMissed(effectiveAppt, state?.status)) {
-        if (state?.status !== "Missed" && state?.status !== "Rolled Over") {
-          const newAppt = calculateRolloverTime(effectiveAppt);
-          updateState(o.id, prev => ({
-            ...prev,
-            status: "Rolled Over",
-            apptOverride: newAppt,
-            rolloverCount: prev.rolloverCount + 1,
-            rollovers: [...prev.rollovers, {
-              originalAppt: effectiveAppt,
-              newAppt,
-              timestamp: new Date().toISOString(),
-              reason: "Automatic rollover (missed >1h)",
-              user: "System",
-            }],
-            notificationDraft: "pending",
-          }));
-        }
+      if (state?.status === "Complete" || state?.status === "Confirmed" || state?.status === "Cancelled") return;
+      // Skip if already rolled today (idempotency)
+      if (state?.rollovers?.some(r => new Date(r.timestamp).toDateString() === today && r.reason.includes("Auto Rollover"))) return;
+
+      const shouldRoll = pastCutoff
+        ? isMissed(effectiveAppt, state?.status) // After cutoff: standard missed check
+        : (Date.now() - new Date(effectiveAppt).getTime() > 60 * 60 * 1000); // Before cutoff: >1h past
+
+      if (shouldRoll && state?.status !== "Rolled Over") {
+        const newAppt = calculateRolloverTime(effectiveAppt);
+        updateState(o.id, prev => ({
+          ...prev,
+          status: "Rolled Over",
+          apptOverride: newAppt,
+          rolloverCount: prev.rolloverCount + 1,
+          rollovers: [...prev.rollovers, {
+            originalAppt: effectiveAppt,
+            newAppt,
+            timestamp: new Date().toISOString(),
+            reason: pastCutoff ? "Missed Pickup Auto Rollover (4:00 PM cutoff)" : "Missed Pickup Auto Rollover",
+            user: "System",
+          }],
+          notificationDraft: "pending",
+        }));
       }
     });
   }, [tick, orders]);
 
-  // Filtered
+  // Filtered — hide orders without appointments (shown in No Appointment Queue)
   const filtered = useMemo(() => {
     return orders.filter(o => {
+      if (!o.appointmentTime && !ltlState[o.id]?.apptOverride) return false; // Hide no-appt from main
       const state = ltlState[o.id];
       if (customerFilter && !(o.customerName || o.customerCode || "").toLowerCase().includes(customerFilter.toLowerCase())) return false;
       if (carrierFilter && !(o.carrierName || o.carrierId || "").toLowerCase().includes(carrierFilter.toLowerCase())) return false;
@@ -257,21 +273,35 @@ export default function LtlAppointmentsPage() {
     });
   }, [orders, ltlState, customerFilter, carrierFilter, rnFilter, dnFilter, loadFilter, statusFilterVal, rolloverFilter]);
 
-  // KPIs
+  // KPIs — production metrics
   const kpis = useMemo(() => {
     void tick;
-    let missed = 0, rolledToday = 0, pending = 0, completed = 0;
+    let missed = 0, rolledToday = 0, pending = 0, completed = 0, exception = 0, autoRolloversToday = 0, wmsSyncFails = 0;
     const today = new Date().toDateString();
+    let totalRolloverMs = 0, rolloverCount = 0;
     orders.forEach(o => {
+      if (!o.appointmentTime && !ltlState[o.id]?.apptOverride) return; // skip no-appt
       const state = ltlState[o.id];
       const effectiveAppt = state?.apptOverride || o.appointmentTime;
       const st = state?.status;
       if (st === "Complete" || st === "Confirmed") { completed++; return; }
+      if (st === "Exception") { exception++; return; }
+      if (st === "Cancelled") return;
       if (st === "Rolled Over" || st === "Missed" || isMissed(effectiveAppt, st)) missed++;
       else pending++;
-      if (state?.rollovers?.some(r => new Date(r.timestamp).toDateString() === today)) rolledToday++;
+      if (state?.rollovers) {
+        state.rollovers.forEach(r => {
+          if (new Date(r.timestamp).toDateString() === today) {
+            rolledToday++;
+            if (r.user === "System") autoRolloversToday++;
+            const diff = new Date(r.newAppt).getTime() - new Date(r.originalAppt).getTime();
+            if (diff > 0) { totalRolloverMs += diff; rolloverCount++; }
+          }
+        });
+      }
     });
-    return { total: orders.length, missed, rolledToday, pending, completed };
+    const avgRolloverHrs = rolloverCount > 0 ? (totalRolloverMs / rolloverCount / 3600000).toFixed(1) : "—";
+    return { total: orders.filter(o => o.appointmentTime || ltlState[o.id]?.apptOverride).length, missed, rolledToday, pending, completed, exception, autoRolloversToday, wmsSyncFails, avgRolloverHrs };
   }, [orders, ltlState, tick]);
 
   // Actions
@@ -316,16 +346,26 @@ export default function LtlAppointmentsPage() {
   return (
     <>
       <h1>LTL Appointment Management</h1>
-      <p className="muted">LTL loads with automatic appointment rollover. Missed appointments are rolled to the next available slot. WMS rollover is a local dashboard draft — appointments are not mutated in WMS.</p>
+      <p className="muted">LTL loads with 4:00 PM pickup cutoff auto-rollover. After cutoff, missed pickups automatically roll to next business day. WMS appointment updates are pending verified integration — rollovers shown as draft proposals.</p>
 
       {/* KPIs */}
-      <section className="stats" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))" }}>
-        <div>Total LTL Loads<br /><b>{kpis.total}</b></div>
+      <section className="stats" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(110px, 1fr))" }}>
+        <div>Total LTL<br /><b>{kpis.total}</b></div>
         <div>Missed<br /><b className="bad">{kpis.missed}</b></div>
-        <div>Rolled Over Today<br /><b className="warn">{kpis.rolledToday}</b></div>
-        <div>Pending<br /><b>{kpis.pending}</b></div>
+        <div>Rolled Today<br /><b className="warn">{kpis.rolledToday}</b></div>
+        <div>Pending<br /><b style={{ color: "#3b82f6" }}>{kpis.pending}</b></div>
         <div>Completed<br /><b className="good">{kpis.completed}</b></div>
+        <div>Exception<br /><b style={{ color: "#ff7a45" }}>{kpis.exception}</b></div>
+        <div>Auto-Rollovers<br /><b className="warn">{kpis.autoRolloversToday}</b></div>
+        <div>WMS Sync Fails<br /><b style={{ color: "#ff7a45" }}>{kpis.wmsSyncFails}</b></div>
+        <div>Avg Rollover<br /><b>{kpis.avgRolloverHrs}h</b></div>
       </section>
+      <div style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 11, color: "#64748b", margin: "4px 0 8px" }}>
+        <span>Pickup cutoff: 4:00 PM ET</span>
+        <span>·</span>
+        <span>{isPastCutoff() ? "⚠ Past cutoff — missed pickups will auto-roll" : "Before cutoff"}</span>
+        <span style={{ marginLeft: "auto" }}><a href="/dashboard/ltl-appointments/no-appointment-queue" style={{ color: "#5539f6", textDecoration: "none", fontSize: 11 }}>No Appointment Queue →</a></span>
+      </div>
 
       {/* Filters */}
       <div style={{ display: "flex", gap: 8, margin: "14px 0 8px", flexWrap: "wrap", alignItems: "center" }}>
@@ -341,6 +381,8 @@ export default function LtlAppointmentsPage() {
           <option value="Confirmed">Confirmed</option>
           <option value="Complete">Complete</option>
           <option value="Pending">Pending</option>
+          <option value="Exception">Exception</option>
+          <option value="Cancelled">Cancelled</option>
         </select>
         <select value={rolloverFilter} onChange={e => setRolloverFilter(e.target.value)} className="filter-select">
           <option value="">Any Rollovers</option>
@@ -353,9 +395,10 @@ export default function LtlAppointmentsPage() {
       {error && <div className="notice" style={{ borderColor: stale ? "#fb7185" : undefined }}>{error}{stale && lastUpdated && <span style={{ display: "block", fontSize: 10, marginTop: 4, color: "#9aa8c7" }}>Last successful update: {lastUpdated}</span>}</div>}
       <div className="actions">
         <button onClick={load} disabled={loading}>{loading ? "Refreshing..." : "Refresh"}</button>
+        <button onClick={() => { const hdr = "Customer,RN,DN,Load,Carrier,Appointment,Status,Rolled Appt,Rollovers,Notes\n"; const rows = filtered.map(o => { const st = ltlState[o.id]; return [o.customerName||"",o.bolNo||"",o.referenceNo||o.id,o.loadNo||"",o.carrierName||o.carrierId||"",o.appointmentTime||"",st?.status||"Pending",st?.apptOverride||"",st?.rolloverCount||0,st?.notes||""].map(v=>`"${String(v).replace(/"/g,"\"\"")}"`) .join(","); }).join("\n"); const b = new Blob([hdr+rows],{type:"text/csv"}); const u=URL.createObjectURL(b); const a=document.createElement("a"); a.href=u; a.download=`ltl-appointments-${new Date().toISOString().slice(0,10)}.csv`; a.click(); URL.revokeObjectURL(u); }} style={{ background: "#16233b", border: "1px solid #26344f", color: "#9aa8c7" }}>Export CSV</button>
         <span style={{ color: "#64748b", fontSize: 10, marginLeft: 8 }}>{filtered.length} LTL loads</span>
         {lastUpdated && <span style={{ fontSize: 10, color: "#64748b", marginLeft: 8 }}>Last Updated: {lastUpdated}</span>}
-        <span style={{ fontSize: 10, color: stale ? "#fb7185" : "#4ade80", marginLeft: 4 }}>{stale ? "● Stale — retrying" : "● Live (45s)"}</span>
+        <span style={{ fontSize: 10, color: stale ? "#fb7185" : "#4ade80", marginLeft: 4 }}>{stale ? "● Stale — retrying" : "● Connected (10m refresh)"}</span>
       </div>
 
       {/* Table */}
@@ -388,7 +431,8 @@ export default function LtlAppointmentsPage() {
               const effectiveAppt = state.apptOverride || originalAppt;
               const missed = isMissed(effectiveAppt, state.status);
               const displayStatus = state.status || (missed ? "Missed" : effectiveAppt ? "Pending" : "No Appt");
-              const statusCls = displayStatus === "Missed" ? "bad" : displayStatus === "Rolled Over" ? "warn" : displayStatus === "Confirmed" || displayStatus === "Complete" ? "good" : "";
+              const statusCls = displayStatus === "Missed" ? "bad" : displayStatus === "Rolled Over" ? "warn" : displayStatus === "Confirmed" || displayStatus === "Complete" ? "good" : displayStatus === "Exception" ? "" : displayStatus === "Pending" ? "" : displayStatus === "Cancelled" ? "" : "";
+              const statusColor = displayStatus === "Missed" ? "#fb7185" : displayStatus === "Rolled Over" ? "#facc15" : displayStatus === "Confirmed" || displayStatus === "Complete" ? "#4ade80" : displayStatus === "Pending" ? "#3b82f6" : displayStatus === "Exception" ? "#ff7a45" : displayStatus === "Cancelled" ? "#64748b" : "#9aa8c7";
               const hasRolledAppt = state.apptOverride && state.apptOverride !== originalAppt;
 
               return (
@@ -411,7 +455,7 @@ export default function LtlAppointmentsPage() {
                       </span>
                     )}
                   </td>
-                  <td><span className={statusCls} style={{ fontWeight: 700 }}>{displayStatus}</span></td>
+                  <td><span style={{ fontWeight: 700, color: statusColor }}>{displayStatus}{state.notificationDraft === "pending" && <span style={{ fontSize: 8, color: "#a99cff", marginLeft: 3 }}>📧 draft</span>}</span></td>
                   <td className={missed ? "bad" : ""}>{missed && effectiveAppt ? timeSinceMissed(effectiveAppt) : "—"}</td>
                   <td style={{ color: hasRolledAppt ? "#facc15" : "#64748b" }}>
                     {hasRolledAppt ? fmt(state.apptOverride) : "—"}
@@ -432,11 +476,9 @@ export default function LtlAppointmentsPage() {
                   </td>
                   <td>
                     <div style={{ display: "flex", gap: 3, flexWrap: "wrap" }}>
-                      <button onClick={() => markStatus(o.id, "Confirmed")} style={{ fontSize: 9, padding: "2px 6px", background: "#052e16", color: "#4ade80", border: "1px solid #16a34a30", borderRadius: 3, cursor: "pointer" }}>✓</button>
-                      <button onClick={() => markStatus(o.id, "Missed")} style={{ fontSize: 9, padding: "2px 6px", background: "#2a0a0f", color: "#fb7185", border: "1px solid #be123c30", borderRadius: 3, cursor: "pointer" }}>✗</button>
-                      <button onClick={() => manualRollover(o.id)} style={{ fontSize: 9, padding: "2px 6px", background: "#1c1505", color: "#facc15", border: "1px solid #ca8a0430", borderRadius: 3, cursor: "pointer" }}>↻</button>
-                      <button onClick={() => markStatus(o.id, "Complete")} style={{ fontSize: 9, padding: "2px 6px", background: "#16233b", color: "#9aa8c7", border: "1px solid #26344f", borderRadius: 3, cursor: "pointer" }}>Done</button>
                       <button onClick={() => setAuditOrderId(o.id)} style={{ fontSize: 9, padding: "2px 6px", background: "#16233b", color: "#a99cff", border: "1px solid #26344f", borderRadius: 3, cursor: "pointer" }}>Audit</button>
+                      <button onClick={() => manualRollover(o.id)} title="Force Rollover (Admin)" style={{ fontSize: 9, padding: "2px 6px", background: "#1c1505", color: "#facc15", border: "1px solid #ca8a0430", borderRadius: 3, cursor: "pointer" }}>↻ Roll</button>
+                      <button onClick={() => markStatus(o.id, "Cancelled")} style={{ fontSize: 9, padding: "2px 6px", background: "#16233b", color: "#64748b", border: "1px solid #26344f", borderRadius: 3, cursor: "pointer" }}>Cancel</button>
                     </div>
                   </td>
                 </tr>
