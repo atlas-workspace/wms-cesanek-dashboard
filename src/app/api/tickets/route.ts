@@ -38,8 +38,21 @@ export async function POST(req: NextRequest) {
       });
 
       const text = await res.text();
-      let json;
-      try { json = JSON.parse(text); } catch { json = { msg: text }; }
+      let json: Record<string, unknown>;
+      try { json = JSON.parse(text); } catch {
+        // API returned non-JSON (e.g. plain text "success") — treat HTTP 2xx as success
+        if (res.ok) {
+          return NextResponse.json({
+            success: true,
+            status: "created",
+            data: { response: text },
+            testMode: true,
+            testRecipient: "erin.cambra@unisco.com",
+            intendedRecipient: payload.customerEmail,
+          });
+        }
+        json = { msg: text || "Unknown error" };
+      }
 
       if (!res.ok) {
         if (res.status === 401 || res.status === 403) {
@@ -62,9 +75,9 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({
         success: true,
         status: "created",
-        data: json.data,
+        data: json.data || json,
         testMode: true,
-        testRecipient: "erin.caa@unisco.com",
+        testRecipient: "erin.cambra@unisco.com",
         intendedRecipient: payload.customerEmail,
       });
     }
