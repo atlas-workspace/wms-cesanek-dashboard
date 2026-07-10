@@ -157,10 +157,23 @@ export default function TicketsPage() {
           Message *
           <textarea value={message} onChange={e => setMessage(e.target.value)} rows={5} placeholder="Describe the issue or outbound communication..." style={{ border: "1px solid #26344f", background: "#101b31", color: "#eaf0ff", borderRadius: 6, padding: "8px 10px", fontSize: 12, resize: "vertical", fontFamily: "inherit" }} />
         </label>
-        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
           <button onClick={createTicket} disabled={sending} style={{ border: 0, borderRadius: 6, background: "#5539f6", color: "#fff", padding: "8px 16px", fontSize: 12, fontWeight: 700, cursor: "pointer", opacity: sending ? 0.5 : 1 }}>
             {sending ? "Creating..." : "Create Test Ticket"}
           </button>
+          <a
+            href={`mailto:${TEST_RECIPIENT}?subject=${encodeURIComponent(title || "Customer Communication")}&body=${encodeURIComponent(message || "")}`}
+            style={{ border: "1px solid #26344f", borderRadius: 6, background: "#16233b", color: "#facc15", padding: "8px 16px", fontSize: 12, fontWeight: 700, textDecoration: "none", display: "inline-block" }}
+            onClick={() => {
+              const emailDraft: TicketDraft = { id: `eml_${Date.now()}`, customerName: customerName || "Cesanek Customer", customerEmail: customerEmail || TEST_RECIPIENT, title: title || "Customer Communication", message, shipmentRef, priority, status: "draft", createdAt: new Date().toISOString(), apiResponse: "Email draft opened (mailto)" };
+              const updated = [emailDraft, ...tickets].slice(0, 100);
+              setTickets(updated);
+              saveTickets(updated);
+              addActivity({ user: username || "ecambra", shipmentId: shipmentRef || emailDraft.id, shipmentRef: shipmentRef || title, action: "Open Test Email Draft", emailStatus: "draft", recipient: TEST_RECIPIENT, intendedRecipient: customerEmail || TEST_RECIPIENT, previousStatus: "", newStatus: "Email Draft Ready", comments: `Subject: ${title}`, module: "notifications" });
+            }}
+          >
+            Open Test Email Draft
+          </a>
           <span style={{ fontSize: 10, color: "#64748b" }}>Routes to: {TEST_RECIPIENT}</span>
         </div>
       </div>
