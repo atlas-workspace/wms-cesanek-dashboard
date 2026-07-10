@@ -23,6 +23,41 @@ interface LtlOrder {
   createdTime?: string;
   shipMethod?: string;
   orderType?: string;
+  // --- WMS Update Enrichment Fields (resolved from order + appointment data) ---
+  appointmentId?: string;
+  preEntryId?: string;
+  loadId?: string;
+  orderIds?: string[];
+  customerIds?: string[];
+  appointmentType?: string;
+  serviceType?: string;
+  currentApptStatus?: string;
+  loadStatus?: string;
+  orderStatus?: string;
+  loadTaskStatus?: string;
+}
+
+// Capability state for WMS mutation readiness
+type WmsCapability = "wms-update-ready" | "status-update-ready" | "read-only";
+
+function getWmsCapability(order: LtlOrder): { state: WmsCapability; missing: string[] } {
+  const missing: string[] = [];
+  if (!order.appointmentId) missing.push("appointmentId");
+  if (!order.carrierId) missing.push("carrierId");
+  if (!order.appointmentType) missing.push("appointmentType");
+  if (!order.customerIds?.length) missing.push("customerIds");
+
+  if (missing.length === 0) return { state: "wms-update-ready", missing: [] };
+  if (order.preEntryId) return { state: "status-update-ready", missing };
+  return { state: "read-only", missing };
+}
+
+function capabilityBadge(cap: { state: WmsCapability; missing: string[] }) {
+  switch (cap.state) {
+    case "wms-update-ready": return { label: "WMS Ready", color: "#4ade80" };
+    case "status-update-ready": return { label: "Status Only", color: "#facc15" };
+    case "read-only": return { label: "Read Only", color: "#64748b" };
+  }
 }
 
 interface RolloverEntry {
@@ -227,18 +262,63 @@ export default function LtlAppointmentsPage() {
     if (!token) return;
     setLoading(true); setError(""); setStale(false);
     try {
-      const json = await wmsProxy(token, "/wms-bam/outbound/order/raw-search", {
-        currentPage: 1, pageSize: 200,
-        shipMethod: "LTL",
-        excludeStatuses: FINAL_STATUSES,
-        sortingFields: [{ field: "createdTime", orderBy: "DESC" }],
+      // Fetch LTL orders and appointments in parallel for enrichment
+      const [orderJson, apptJson] = await Promise.all([
+        wmsProxy(token, "/wms-bam/outbound/order/raw-search", {
+          currentPage: 1, pageSize: 200,
+          shipMethod: "LTL",
+          excludeStatuses: FINAL_STATUSES,
+          sortingFields: [{ field: "createdTime", orderBy: "DESC" }],
+        }),
+        wmsProxy(token, "/wms-bam/appointment/search-by-paging", { currentPage: 1, pageSize: 200 }).catch(() => null),
+      ]);
+      if (orderJson?.success === false && orderJson?.msg) throw new Error(orderJson.msg);
+      const rawOrders: LtlOrder[] = Array.isArray(orderJson?.data) ? orderJson.data : [];
+
+      // Build appointment lookup by reference/load for enrichment
+      const apptList: Record<string, unknown>[] = apptJson?.data?.list || [];
+      const apptByRef = new Map<string, Record<string, unknown>>();
+      apptList.forEach((a: Record<string, unknown>) => {
+        const actions = (a.appointmentActions as { referenceNos?: string[]; loads?: { loadNo?: string; id?: string }[]; serviceType?: string }[]) || [];
+        actions.forEach(act => {
+          act.referenceNos?.forEach(ref => apptByRef.set(ref?.toUpperCase(), a));
+          act.loads?.forEach(l => { if (l.loadNo) apptByRef.set(l.loadNo.toUpperCase(), a); if (l.id) apptByRef.set(l.id, a); });
+        });
+        if (a.id) apptByRef.set(String(a.id), a);
+        if (a.sid) apptByRef.set(String(a.sid).toUpperCase(), a);
       });
-      if (json?.success === false && json?.msg) throw new Error(json.msg);
-      const list: LtlOrder[] = Array.isArray(json?.data) ? json.data : [];
-      setOrders(list.filter(o => {
-        const upper = (o.status || "").toUpperCase();
-        return !FINAL_STATUSES.includes(upper);
-      }));
+
+      // Enrich each order with appointment WMS fields
+      const enriched = rawOrders.filter(o => !FINAL_STATUSES.includes((o.status || "").toUpperCase())).map(o => {
+        const enriched = { ...o } as LtlOrder;
+        // Try to match appointment by referenceNo, loadNo, or id
+        const matchKeys = [o.referenceNo, o.loadNo, o.id, o.bolNo].filter(Boolean).map(k => k!.toUpperCase());
+        let matchedAppt: Record<string, unknown> | undefined;
+        for (const key of matchKeys) {
+          matchedAppt = apptByRef.get(key);
+          if (matchedAppt) break;
+        }
+        if (matchedAppt) {
+          enriched.appointmentId = matchedAppt.id ? String(matchedAppt.id) : undefined;
+          enriched.preEntryId = matchedAppt.preCheckNo ? String(matchedAppt.preCheckNo) : undefined;
+          enriched.currentApptStatus = matchedAppt.apptStatus ? String(matchedAppt.apptStatus) : undefined;
+          enriched.appointmentType = matchedAppt.appointmentType ? String(matchedAppt.appointmentType) : undefined;
+          enriched.customerIds = Array.isArray(matchedAppt.customerIds) ? matchedAppt.customerIds as string[] : undefined;
+          // Extract serviceType from first action
+          const actions = (matchedAppt.appointmentActions as { serviceType?: string }[]) || [];
+          if (actions[0]?.serviceType) enriched.serviceType = actions[0].serviceType;
+          // Use appointment time from WMS if more authoritative
+          if (matchedAppt.appointmentTime && !enriched.appointmentTime) enriched.appointmentTime = String(matchedAppt.appointmentTime);
+        }
+        // Fields from order itself
+        enriched.loadId = o.loadNo || undefined;
+        enriched.orderIds = o.id ? [o.id] : undefined;
+        enriched.orderStatus = o.status;
+        if (!enriched.customerIds && o.customerCode) enriched.customerIds = [o.customerCode];
+        return enriched;
+      });
+
+      setOrders(enriched);
       setLastUpdated(new Date().toLocaleString("en-US", { timeZone: "America/New_York", month: "2-digit", day: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" }));
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "Unable to retrieve the latest appointment data. Retrying...");
@@ -354,27 +434,80 @@ export default function LtlAppointmentsPage() {
     updateState(orderId, prev => ({ ...prev, status }));
   }, [updateState]);
 
-  const manualRollover = useCallback((orderId: string) => {
+  const manualRollover = useCallback(async (orderId: string) => {
     const state = ltlState[orderId];
     const order = orders.find(o => o.id === orderId);
     const effectiveAppt = state?.apptOverride || order?.appointmentTime;
-    if (!effectiveAppt) return;
+    if (!effectiveAppt || !order) return;
     const newAppt = calculateRolloverTime(effectiveAppt);
-    updateState(orderId, prev => ({
-      ...prev,
-      status: "Rolled Over",
-      apptOverride: newAppt,
-      rolloverCount: prev.rolloverCount + 1,
-      rollovers: [...prev.rollovers, {
-        originalAppt: effectiveAppt,
-        newAppt,
-        timestamp: new Date().toISOString(),
-        reason: "Manual rollover by user",
-        user: username || "ecambra",
-      }],
-      notificationDraft: "pending",
-    }));
-  }, [ltlState, orders, updateState, username]);
+    const cap = getWmsCapability(order);
+
+    if (cap.state === "wms-update-ready" && token && order.appointmentId) {
+      // Attempt guarded WMS appointment update
+      try {
+        const updateRes = await wmsProxy(token, `/wms/appointment/${order.appointmentId}`, {
+          appointmentTime: newAppt,
+          carrierId: order.carrierId,
+          appointmentType: order.appointmentType,
+          serviceType: order.serviceType,
+          customerIds: order.customerIds,
+        });
+        // Readback verification
+        const readback = await wmsProxy(token, `/wms-bam/appointment/${order.appointmentId}`, {});
+        const verified = readback?.appointmentTime === newAppt || readback?.data?.appointmentTime === newAppt;
+
+        updateState(orderId, prev => ({
+          ...prev,
+          status: verified ? "Rolled Over" : "Rolled Over",
+          apptOverride: newAppt,
+          rolloverCount: prev.rolloverCount + 1,
+          rollovers: [...prev.rollovers, {
+            originalAppt: effectiveAppt,
+            newAppt,
+            timestamp: new Date().toISOString(),
+            reason: "Manual rollover by user",
+            user: username || "ecambra",
+            wmsStatus: verified ? "verified" : "pending",
+          }],
+          notificationDraft: "pending",
+        }));
+      } catch {
+        // WMS update failed — fall back to draft proposal
+        updateState(orderId, prev => ({
+          ...prev,
+          status: "Rolled Over",
+          apptOverride: newAppt,
+          rolloverCount: prev.rolloverCount + 1,
+          rollovers: [...prev.rollovers, {
+            originalAppt: effectiveAppt,
+            newAppt,
+            timestamp: new Date().toISOString(),
+            reason: "Manual rollover (WMS update failed — draft only)",
+            user: username || "ecambra",
+            wmsStatus: "failed",
+          }],
+          notificationDraft: "pending",
+        }));
+      }
+    } else {
+      // Not WMS-ready: local draft only
+      updateState(orderId, prev => ({
+        ...prev,
+        status: "Rolled Over",
+        apptOverride: newAppt,
+        rolloverCount: prev.rolloverCount + 1,
+        rollovers: [...prev.rollovers, {
+          originalAppt: effectiveAppt,
+          newAppt,
+          timestamp: new Date().toISOString(),
+          reason: cap.state === "read-only" ? `Draft rollover (missing: ${cap.missing.join(", ")})` : "Manual rollover by user",
+          user: username || "ecambra",
+          wmsStatus: "pending",
+        }],
+        notificationDraft: "pending",
+      }));
+    }
+  }, [ltlState, orders, updateState, username, token]);
 
   const saveAppt = useCallback((orderId: string, value: string) => {
     updateState(orderId, prev => ({ ...prev, apptOverride: value }));
@@ -471,6 +604,7 @@ export default function LtlAppointmentsPage() {
               <th>DN</th>
               <th>Load #</th>
               <th>Carrier</th>
+              <th>WMS</th>
               <th>Appointment</th>
               <th>Appt Status</th>
               <th>Time Since Missed</th>
@@ -481,9 +615,9 @@ export default function LtlAppointmentsPage() {
             </tr>
           </thead>
           <tbody>
-            {loading && <tr><td colSpan={12} style={{ textAlign: "center", padding: 40, color: "#64748b" }}>Loading LTL data...</td></tr>}
+            {loading && <tr><td colSpan={13} style={{ textAlign: "center", padding: 40, color: "#64748b" }}>Loading LTL data...</td></tr>}
             {!loading && filtered.length === 0 && !error && (
-              <tr><td colSpan={12} style={{ textAlign: "center", padding: 40, color: "#64748b" }}>No LTL loads match filters. LTL classification uses the shipMethod field from WMS.</td></tr>
+              <tr><td colSpan={13} style={{ textAlign: "center", padding: 40, color: "#64748b" }}>No LTL loads match filters. LTL classification uses the shipMethod field from WMS.</td></tr>
             )}
             {displaySlice.map(o => {
               const state = ltlState[o.id] || { rollovers: [], rolloverCount: 0, notes: "" };
@@ -502,6 +636,7 @@ export default function LtlAppointmentsPage() {
                   <td style={{ fontWeight: 600 }}>{o.referenceNo || o.id}</td>
                   <td>{o.loadNo || "—"}</td>
                   <td>{o.carrierName || o.carrierId || "—"}</td>
+                  <td>{(() => { const cap = getWmsCapability(o); const b = capabilityBadge(cap); return <span title={cap.missing.length ? `Missing: ${cap.missing.join(", ")}` : "All WMS fields available"} style={{ fontSize: 9, fontWeight: 700, color: b.color }}>{b.label}</span>; })()}</td>
                   <td>
                     {editingAppt === o.id ? (
                       <span style={{ display: "flex", gap: 3 }}>
