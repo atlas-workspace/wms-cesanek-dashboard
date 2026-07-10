@@ -10,6 +10,7 @@ const NAV_ITEMS = [
   { href: "/dashboard/sla", label: "SLA Monitoring" },
   { href: "/dashboard/missed-appointments", label: "Appointments" },
   { href: "/dashboard/ltl-appointments", label: "LTL Appointments" },
+  { href: "/dashboard/tickets", label: "Tickets" },
   { href: "/dashboard/notifications", label: "Notifications" },
   { href: "/dashboard/activity-log", label: "Activity Log" },
 ];
