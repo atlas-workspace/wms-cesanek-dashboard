@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState, useCallback } from "react";
 import { useAuth } from "@/lib/auth-context";
+import { saveActivityEntry, getShipmentActivity, type ActivityEntry } from "@/app/dashboard/activity-log/page";
 
 // --- Types ---
 interface Appointment {
@@ -449,6 +450,38 @@ export default function MissedAppointmentsPage() {
   const [dateTo, setDateTo] = useState("");
   const [drillCarrier, setDrillCarrier] = useState("");
 
+  // Sortable columns
+  type ApptSortCol = "customer" | "rn" | "dn" | "type" | "carrier" | "scheduled" | "timeSince" | "status";
+  type ApptSortDir = "asc" | "desc" | null;
+  const [sortCol, setSortCol] = useState<ApptSortCol | null>(null);
+  const [sortDir, setSortDir] = useState<ApptSortDir>(null);
+  const handleSort = useCallback((col: ApptSortCol) => {
+    if (sortCol !== col) { setSortCol(col); setSortDir("asc"); }
+    else if (sortDir === "asc") { setSortDir("desc"); }
+    else { setSortCol(null); setSortDir(null); }
+  }, [sortCol, sortDir]);
+  function sortInd(col: ApptSortCol) { if (sortCol !== col) return "▲▼"; return sortDir === "asc" ? "▲" : "▼"; }
+
+  // Detail panel
+  const [selectedAppt, setSelectedAppt] = useState<Appointment | null>(null);
+  const [panelActivity, setPanelActivity] = useState<ActivityEntry[]>([]);
+
+  // Test mode notification
+  const TEST_RECIPIENT = "erin.cambra@unisco.com";
+  function sendTestNotification(appt: Appointment, template: "missed" | "late" | "rescheduled") {
+    const subjects: Record<string, string> = { missed: "Missed Appointment Notification", late: "Carrier Running Late", rescheduled: "Your Appointment Has Been Rescheduled" };
+    saveActivityEntry({ shipmentId: appt.id, orderNumber: appt.sid || appt.id, user: "System", previousStatus: "", newStatus: template === "missed" ? "Missed Appointment" : template === "late" ? "Late" : "Rescheduled", action: `Test notification: ${subjects[template]}`, emailSent: "test", recipient: TEST_RECIPIENT, comments: `Template: ${subjects[template]}. Test Mode — routed to ${TEST_RECIPIENT} only.` });
+  }
+
+  // Mark status action
+  function markApptAction(appt: Appointment, newStatus: string) {
+    const prev = statusMap.get(appt.id)?.label || "Unknown";
+    saveActivityEntry({ shipmentId: appt.id, orderNumber: appt.sid || appt.id, user: "ecambra", previousStatus: prev, newStatus, action: `Status changed to ${newStatus}`, emailSent: "no", recipient: "", comments: "" });
+    if (newStatus === "Missed Appointment") sendTestNotification(appt, "missed");
+    if (newStatus === "Late") sendTestNotification(appt, "late");
+    if (newStatus === "Rescheduled") sendTestNotification(appt, "rescheduled");
+  }
+
   // Live refresh interval (45 seconds default)
   const REFRESH_INTERVAL_MS = 45000;
   const OPEN_ORDER_STATUSES = [
@@ -529,20 +562,35 @@ export default function MissedAppointmentsPage() {
     });
   }, [appointments, statusMap, customerFilter, carrierFilter, typeFilter, statusFilterVal, rnFilter, dnFilter, dateFrom, dateTo, drillCarrier]);
 
-  // Sort: Missed first, then by time since missed desc, then oldest first
+  // Sort: user column sort or default (missed first, then oldest)
   const sorted = useMemo(() => {
     void tick;
-    return [...filtered].sort((a, b) => {
-      const sa = statusMap.get(a.id);
-      const sb = statusMap.get(b.id);
-      const orderA = sa?.label === "Missed Appointment" ? 0 : sa?.label === "Late" ? 1 : 2;
-      const orderB = sb?.label === "Missed Appointment" ? 0 : sb?.label === "Late" ? 1 : 2;
-      if (orderA !== orderB) return orderA - orderB;
-      const tA = a.appointmentTime ? new Date(a.appointmentTime).getTime() : Infinity;
-      const tB = b.appointmentTime ? new Date(b.appointmentTime).getTime() : Infinity;
-      return tA - tB;
+    const arr = [...filtered];
+    if (!sortCol || !sortDir) {
+      return arr.sort((a, b) => {
+        const sa = statusMap.get(a.id); const sb = statusMap.get(b.id);
+        const oA = sa?.label === "Missed Appointment" ? 0 : sa?.label === "Late" ? 1 : 2;
+        const oB = sb?.label === "Missed Appointment" ? 0 : sb?.label === "Late" ? 1 : 2;
+        if (oA !== oB) return oA - oB;
+        return (a.appointmentTime ? new Date(a.appointmentTime).getTime() : Infinity) - (b.appointmentTime ? new Date(b.appointmentTime).getTime() : Infinity);
+      });
+    }
+    const dir = sortDir === "asc" ? 1 : -1;
+    return arr.sort((a, b) => {
+      let cmp = 0;
+      switch (sortCol) {
+        case "customer": cmp = getCustomerName(a).localeCompare(getCustomerName(b), undefined, { sensitivity: "base" }); break;
+        case "rn": cmp = getRN(a).localeCompare(getRN(b), undefined, { sensitivity: "base" }); break;
+        case "dn": cmp = getDN(a).localeCompare(getDN(b), undefined, { sensitivity: "base" }); break;
+        case "type": cmp = (a.appointmentType || "").localeCompare(b.appointmentType || "", undefined, { sensitivity: "base" }); break;
+        case "carrier": cmp = (a.carrierName || a.carrierId || "").localeCompare(b.carrierName || b.carrierId || "", undefined, { sensitivity: "base" }); break;
+        case "scheduled": cmp = (a.appointmentTime ? new Date(a.appointmentTime).getTime() : 0) - (b.appointmentTime ? new Date(b.appointmentTime).getTime() : 0); break;
+        case "timeSince": { const ta = a.appointmentTime ? Date.now() - new Date(a.appointmentTime).getTime() : 0; const tb = b.appointmentTime ? Date.now() - new Date(b.appointmentTime).getTime() : 0; cmp = ta - tb; break; }
+        case "status": { const sa = statusMap.get(a.id); const sb = statusMap.get(b.id); const pA = sa?.label === "Missed Appointment" ? 0 : sa?.label === "Late" ? 1 : sa?.label === "On Time" ? 3 : 2; const pB = sb?.label === "Missed Appointment" ? 0 : sb?.label === "Late" ? 1 : sb?.label === "On Time" ? 3 : 2; cmp = pA - pB; break; }
+      }
+      return cmp * dir;
     });
-  }, [filtered, statusMap, tick]);
+  }, [filtered, statusMap, sortCol, sortDir, tick]);
 
   // KPI metrics
   const kpis = useMemo(() => {
@@ -704,26 +752,27 @@ export default function MissedAppointmentsPage() {
         <table>
           <thead>
             <tr>
-              <th>Customer</th>
-              <th>RN</th>
-              <th>DN</th>
-              <th>Appt Type</th>
-              <th>Carrier</th>
-              <th>Scheduled Date</th>
-              <th>Time Since Missed</th>
-              <th>Status</th>
+              <th style={{ width: 20 }}></th>
+              <th style={{ cursor: "pointer" }} onClick={() => handleSort("customer")}>Customer <span style={{ opacity: sortCol === "customer" ? 1 : 0.3, fontSize: 9 }}>{sortInd("customer")}</span></th>
+              <th style={{ cursor: "pointer" }} onClick={() => handleSort("rn")}>RN <span style={{ opacity: sortCol === "rn" ? 1 : 0.3, fontSize: 9 }}>{sortInd("rn")}</span></th>
+              <th style={{ cursor: "pointer" }} onClick={() => handleSort("dn")}>DN <span style={{ opacity: sortCol === "dn" ? 1 : 0.3, fontSize: 9 }}>{sortInd("dn")}</span></th>
+              <th style={{ cursor: "pointer" }} onClick={() => handleSort("type")}>Appt Type <span style={{ opacity: sortCol === "type" ? 1 : 0.3, fontSize: 9 }}>{sortInd("type")}</span></th>
+              <th style={{ cursor: "pointer" }} onClick={() => handleSort("carrier")}>Carrier <span style={{ opacity: sortCol === "carrier" ? 1 : 0.3, fontSize: 9 }}>{sortInd("carrier")}</span></th>
+              <th style={{ cursor: "pointer" }} onClick={() => handleSort("scheduled")}>Scheduled Date <span style={{ opacity: sortCol === "scheduled" ? 1 : 0.3, fontSize: 9 }}>{sortInd("scheduled")}</span></th>
+              <th style={{ cursor: "pointer" }} onClick={() => handleSort("timeSince")}>Time Since Missed <span style={{ opacity: sortCol === "timeSince" ? 1 : 0.3, fontSize: 9 }}>{sortInd("timeSince")}</span></th>
+              <th style={{ cursor: "pointer" }} onClick={() => handleSort("status")}>Status <span style={{ opacity: sortCol === "status" ? 1 : 0.3, fontSize: 9 }}>{sortInd("status")}</span></th>
             </tr>
           </thead>
           <tbody>
             {!loading && sorted.length === 0 && !error && (
-              <tr><td colSpan={8} style={{ textAlign: "center", padding: 40, color: "#64748b" }}>No appointments match the current filters.</td></tr>
+              <tr><td colSpan={9} style={{ textAlign: "center", padding: 40, color: "#64748b" }}>No appointments match the current filters.</td></tr>
             )}
             {sorted.map(a => {
               const status = statusMap.get(a.id) || getApptStatus(a);
               const ts = a.appointmentTime && status.label === "Missed Appointment" ? timeSince(a.appointmentTime) : null;
-              const rowCls = status.label === "Missed Appointment" ? "row-critical" : status.label === "Late" ? "row-approaching" : "";
               return (
-                <tr key={a.id} className={rowCls}>
+                <tr key={a.id} style={{ cursor: "pointer" }} onClick={() => { setSelectedAppt(a); setPanelActivity(getShipmentActivity(a.id)); }}>
+                  <td style={{ textAlign: "center", color: "#5539f6", fontSize: 12 }}>▶</td>
                   <td>{getCustomerName(a)}</td>
                   <td>{getRN(a)}</td>
                   <td>{getDN(a)}</td>
@@ -738,6 +787,63 @@ export default function MissedAppointmentsPage() {
           </tbody>
         </table>
       </div>
+      {/* Appointment Detail Panel */}
+      {selectedAppt && (
+        <div className="detail-overlay" onClick={() => setSelectedAppt(null)}>
+          <aside className="detail-panel" onClick={e => e.stopPropagation()}>
+            <div style={{ display: "flex", justifyContent: "space-between", borderBottom: "1px solid #26344f", paddingBottom: 10, marginBottom: 12 }}>
+              <div><p style={{ fontSize: 10, color: "#8899b4", margin: 0 }}>APPOINTMENT DETAIL</p><h2 style={{ fontSize: 16, margin: "2px 0 0", color: "#eaf0ff" }}>{selectedAppt.sid || selectedAppt.id}</h2></div>
+              <button onClick={() => setSelectedAppt(null)} style={{ background: "#26344f", border: 0, color: "#9aa8c7", borderRadius: 6, width: 28, height: 28, cursor: "pointer" }}>✕</button>
+            </div>
+            <div style={{ fontSize: 12, color: "#cdd6f4", display: "grid", gap: 3 }}>
+              <div style={{ display: "flex", justifyContent: "space-between" }}><span style={{ color: "#8899b4" }}>Customer</span><span>{getCustomerName(selectedAppt)}</span></div>
+              <div style={{ display: "flex", justifyContent: "space-between" }}><span style={{ color: "#8899b4" }}>RN</span><span>{getRN(selectedAppt)}</span></div>
+              <div style={{ display: "flex", justifyContent: "space-between" }}><span style={{ color: "#8899b4" }}>DN</span><span>{getDN(selectedAppt)}</span></div>
+              <div style={{ display: "flex", justifyContent: "space-between" }}><span style={{ color: "#8899b4" }}>Appointment Type</span><span>{selectedAppt.appointmentType || "—"}</span></div>
+              <div style={{ display: "flex", justifyContent: "space-between" }}><span style={{ color: "#8899b4" }}>Carrier</span><span>{selectedAppt.carrierName || selectedAppt.carrierId || "—"}</span></div>
+              <div style={{ display: "flex", justifyContent: "space-between" }}><span style={{ color: "#8899b4" }}>Scheduled</span><span>{fmt(selectedAppt.appointmentTime)}</span></div>
+              <div style={{ display: "flex", justifyContent: "space-between" }}><span style={{ color: "#8899b4" }}>Status</span><span className={(statusMap.get(selectedAppt.id) || getApptStatus(selectedAppt)).cls} style={{ fontWeight: 600 }}>{(statusMap.get(selectedAppt.id) || getApptStatus(selectedAppt)).badge} {(statusMap.get(selectedAppt.id) || getApptStatus(selectedAppt)).label}</span></div>
+              <div style={{ display: "flex", justifyContent: "space-between" }}><span style={{ color: "#8899b4" }}>Check-In Time</span><span>{selectedAppt.startTime ? fmt(selectedAppt.startTime) : "—"}</span></div>
+              <div style={{ display: "flex", justifyContent: "space-between" }}><span style={{ color: "#8899b4" }}>WMS Status</span><span>{selectedAppt.apptStatus || "—"}</span></div>
+            </div>
+
+            {/* Actions */}
+            <div style={{ borderTop: "1px solid #26344f", marginTop: 12, paddingTop: 10 }}>
+              <p style={{ fontSize: 10, color: "#8899b4", margin: "0 0 6px", textTransform: "uppercase" }}>Actions</p>
+              <div style={{ display: "flex", gap: 5, flexWrap: "wrap" }}>
+                <button onClick={() => markApptAction(selectedAppt, "In Progress")} className="panel-btn">In Progress</button>
+                <button onClick={() => markApptAction(selectedAppt, "Missed Appointment")} className="panel-btn" style={{ borderColor: "#7f1d1d", color: "#fca5a5" }}>Mark Missed</button>
+                <button onClick={() => markApptAction(selectedAppt, "Late")} className="panel-btn" style={{ borderColor: "#713f12", color: "#fde68a" }}>Mark Late</button>
+                <button onClick={() => markApptAction(selectedAppt, "Completed")} className="panel-btn" style={{ borderColor: "#052e16", color: "#4ade80" }}>Completed</button>
+                <button onClick={() => markApptAction(selectedAppt, "Rescheduled")} className="panel-btn">Rescheduled</button>
+              </div>
+              <div style={{ display: "flex", gap: 5, flexWrap: "wrap", marginTop: 6 }}>
+                <button onClick={() => { const st = (statusMap.get(selectedAppt.id) || getApptStatus(selectedAppt)).label; const tmpl = st === "Missed Appointment" ? "missed" : st === "Late" ? "late" : "rescheduled"; sendTestNotification(selectedAppt, tmpl); setPanelActivity(getShipmentActivity(selectedAppt.id)); }} className="panel-btn primary">Send Customer Notification</button>
+                <button onClick={() => { sendTestNotification(selectedAppt, "late"); setPanelActivity(getShipmentActivity(selectedAppt.id)); }} className="panel-btn">Notify Carrier</button>
+              </div>
+              <p style={{ fontSize: 9, color: "#64748b", marginTop: 6 }}>Test Mode — notifications route to {TEST_RECIPIENT} only.</p>
+            </div>
+
+            {/* Activity History */}
+            <div style={{ borderTop: "1px solid #26344f", marginTop: 12, paddingTop: 10 }}>
+              <p style={{ fontSize: 10, color: "#8899b4", margin: "0 0 6px", textTransform: "uppercase" }}>Activity History</p>
+              {panelActivity.length === 0 && <p style={{ fontSize: 11, color: "#64748b" }}>No activity recorded for this appointment.</p>}
+              <div style={{ maxHeight: 200, overflowY: "auto" }}>
+                {panelActivity.map(e => (
+                  <div key={e.id} style={{ borderBottom: "1px solid #1e2d47", padding: "6px 0", fontSize: 11 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", color: "#9aa8c7" }}>
+                      <span>{e.user}</span>
+                      <span>{new Date(e.timestamp).toLocaleString("en-US", { timeZone: "America/New_York", month: "numeric", day: "numeric", hour: "numeric", minute: "2-digit" })}</span>
+                    </div>
+                    <p style={{ margin: "2px 0", color: "#eaf0ff" }}>{e.action}</p>
+                    {e.emailSent !== "no" && <p style={{ margin: 0, fontSize: 10, color: "#facc15" }}>Email: {e.emailSent} → {e.recipient}</p>}
+                  </div>
+                ))}
+              </div>
+            </div>
+          </aside>
+        </div>
+      )}
     </>
   );
 }

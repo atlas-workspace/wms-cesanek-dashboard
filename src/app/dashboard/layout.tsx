@@ -11,6 +11,7 @@ const NAV_ITEMS = [
   { href: "/dashboard/missed-appointments", label: "Appointments" },
   { href: "/dashboard/ltl-appointments", label: "LTL Appointments" },
   { href: "/dashboard/notifications", label: "Notifications" },
+  { href: "/dashboard/activity-log", label: "Activity Log" },
 ];
 
 // Module-level error boundary — isolates each tab so one failure doesn't crash the dashboard
