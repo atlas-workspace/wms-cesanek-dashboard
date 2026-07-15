@@ -154,8 +154,22 @@ function CarrierMiniChart({ data }: { data: { label: string; value: number }[] }
   );
 }
 
+// --- Cutoff Timer ---
+function CutoffTimer() {
+  const [, setT] = useState(0);
+  useEffect(() => { const i = setInterval(() => setT(t => t + 1), 60000); return () => clearInterval(i); }, []);
+  const now = new Date();
+  const est = new Date(now.toLocaleString("en-US", { timeZone: "America/New_York" }));
+  const cutoff = new Date(est); cutoff.setHours(16, 0, 0, 0);
+  if (est >= cutoff) return <span style={{ color: "#fb7185", fontWeight: 700, fontSize: 11, animation: "pulse 1s infinite" }}>⚠ PAST CUTOFF</span>;
+  const diff = cutoff.getTime() - est.getTime();
+  const h = Math.floor(diff / 3600000); const m = Math.floor((diff % 3600000) / 60000);
+  const color = h >= 2 ? "#4ade80" : h >= 1 ? "#facc15" : m >= 30 ? "#ff7a45" : "#fb7185";
+  return <span style={{ color, fontWeight: 700, fontSize: 11 }}>Cutoff: {h}h {m}m</span>;
+}
+
 // =============================================================================
-// COMMAND CENTER COMPONENT
+// MASTER OPERATIONS CONTROL CENTER
 // =============================================================================
 export default function CommandCenter() {
   const { token } = useAuth();
@@ -169,9 +183,10 @@ export default function CommandCenter() {
 
   const [refreshedAt, setRefreshedAt] = useState<string>("");
   const [stale, setStale] = useState(false);
+  const [globalSearch, setGlobalSearch] = useState("");
 
-  // Live refresh interval (45 seconds)
-  const REFRESH_INTERVAL_MS = 45000;
+  // Live refresh interval — 10 minutes production default
+  const REFRESH_INTERVAL_MS = 600000;
 
   useEffect(() => { const i = setInterval(() => setTick(t => t + 1), 30000); return () => clearInterval(i); }, []);
   useEffect(() => { try { const s = sessionStorage.getItem("cesanekApptOverrides"); if (s) setLocalAppts(JSON.parse(s)); } catch {} }, []);
@@ -208,10 +223,26 @@ export default function CommandCenter() {
     return () => clearInterval(i);
   }, [loadData]);
 
-  // --- Computed data ---
+  // --- Computed data (filtered by global search) ---
+  const searchedOrders = useMemo(() => {
+    if (!globalSearch) return orders;
+    const q = globalSearch.toLowerCase();
+    return orders.filter(o =>
+      (o.customerName || "").toLowerCase().includes(q) ||
+      (o.customerCode || "").toLowerCase().includes(q) ||
+      (o.referenceNo || "").toLowerCase().includes(q) ||
+      (o.loadNo || "").toLowerCase().includes(q) ||
+      (o.carrierId || "").toLowerCase().includes(q) ||
+      (o.carrierName || "").toLowerCase().includes(q) ||
+      (o.poNo || "").toLowerCase().includes(q) ||
+      (o.bolNo || "").toLowerCase().includes(q) ||
+      o.id.toLowerCase().includes(q)
+    );
+  }, [orders, globalSearch]);
+
   const orderMetrics = useMemo(() => {
     void tick;
-    const items = orders.map(o => {
+    const items = searchedOrders.map(o => {
       const ea = localAppts[o.id] || o.appointmentTime;
       const s = slaInfo(o.createdTime, ea);
       return { ...o, sla: s, effectiveAppt: ea };
@@ -258,12 +289,33 @@ export default function CommandCenter() {
 
   return (
     <>
-      {/* Sticky Exception Banner */}
-      <div className="exception-banner">
+      {/* Operations Control Center Header */}
+      <div className="exception-banner" style={{ justifyContent: "space-between" }}>
+        <div style={{ display: "flex", gap: 14, alignItems: "center" }}>
+          <span style={{ color: "#eaf0ff", fontWeight: 700 }}>Operations Control Center</span>
+          <span style={{ color: "#8899b4" }}>{new Date().toLocaleDateString("en-US", { timeZone: "America/New_York", weekday: "short", month: "short", day: "numeric" })}</span>
+          <span style={{ color: "#8899b4" }}>Hours: 8:00 AM – 4:00 PM</span>
+          <CutoffTimer />
+        </div>
+        <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+          <span style={{ color: stale ? "#fb7185" : "#4ade80", fontSize: 10 }}>{stale ? "● WMS Disconnected" : "● WMS Connected"}</span>
+          {refreshedAt && <span style={{ fontSize: 10, color: "#64748b" }}>Updated: {refreshedAt}</span>}
+        </div>
+      </div>
+
+      {/* Exception Summary */}
+      <div style={{ display: "flex", gap: 12, padding: "6px 0", fontSize: 11, fontWeight: 700, flexWrap: "wrap" }}>
         <span className="bad">🔴 Out of SLA: {orderMetrics.outOfSla}</span>
         <span className="bad">🔴 Critical: {orderMetrics.critical}</span>
         <span className="warn">🟡 Approaching: {orderMetrics.approaching}</span>
         <span className="bad">🔴 Missed Appts: {apptMetrics.missed}</span>
+        <span style={{ color: "#ff7a45" }}>⚠ Exceptions: {orderMetrics.missingAppt}</span>
+      </div>
+
+      {/* Global Search */}
+      <div style={{ margin: "8px 0", display: "flex", gap: 8, alignItems: "center" }}>
+        <input type="text" placeholder="Search by Customer, RN, DN, Load, Carrier, PO..." value={globalSearch} onChange={e => setGlobalSearch(e.target.value)} style={{ flex: 1, maxWidth: 400, border: "1px solid #26344f", background: "#101b31", color: "#eaf0ff", borderRadius: 6, padding: "7px 12px", fontSize: 12 }} />
+        {globalSearch && <button onClick={() => setGlobalSearch("")} style={{ border: 0, background: "#26344f", color: "#9aa8c7", borderRadius: 4, padding: "4px 8px", fontSize: 10, cursor: "pointer" }}>Clear</button>}
       </div>
 
       {/* Compact KPI Row */}
@@ -367,11 +419,43 @@ export default function CommandCenter() {
         <a href="/dashboard/notifications" style={{ fontSize: 12, color: "#5539f6", textDecoration: "none" }}>Open Notifications →</a>
       </Section>
 
-      <div className="actions" style={{ marginTop: 16 }}>
+      {/* SLA Performance Module */}
+      <Section title="SLA Performance" defaultOpen={false} badge={<span style={{ fontSize: 10, color: "#64748b", marginLeft: 8 }}>Compliance overview</span>}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(100px, 1fr))", gap: 6, fontSize: 11 }}>
+          <div style={{ background: "#101b31", borderRadius: 6, padding: 8 }}><span style={{ color: "#8899b4" }}>On Track</span><br /><b className="good">{orderMetrics.scheduled}</b></div>
+          <div style={{ background: "#101b31", borderRadius: 6, padding: 8 }}><span style={{ color: "#8899b4" }}>At Risk</span><br /><b className="warn">{orderMetrics.approaching + orderMetrics.critical}</b></div>
+          <div style={{ background: "#101b31", borderRadius: 6, padding: 8 }}><span style={{ color: "#8899b4" }}>Breached</span><br /><b className="bad">{orderMetrics.outOfSla}</b></div>
+          <div style={{ background: "#101b31", borderRadius: 6, padding: 8 }}><span style={{ color: "#8899b4" }}>Compliance</span><br /><b className="good">{orderMetrics.total > 0 ? Math.round((orderMetrics.scheduled / orderMetrics.total) * 100) : 0}%</b></div>
+        </div>
+        <a href="/dashboard/sla" style={{ fontSize: 11, color: "#5539f6", textDecoration: "none", marginTop: 8, display: "inline-block" }}>Open full SLA dashboard →</a>
+      </Section>
+
+      {/* Customer Performance Module */}
+      <Section title="Customer Impact" defaultOpen={false} badge={<span style={{ fontSize: 10, color: "#64748b", marginLeft: 8 }}>Highest exceptions</span>}>
+        {apptMetrics.mostImpacted !== "—" ? (
+          <div style={{ fontSize: 11, color: "#9aa8c7" }}>Most impacted: <b style={{ color: "#a99cff" }}>{apptMetrics.mostImpacted}</b></div>
+        ) : <p style={{ fontSize: 11, color: "#64748b" }}>No customer exception data available.</p>}
+      </Section>
+
+      {/* Exceptions Queue */}
+      <Section title="Exceptions Queue" defaultOpen={false} badge={<span className="bad" style={{ fontSize: 10, marginLeft: 8 }}>{orderMetrics.missingAppt + apptMetrics.missed}</span>}>
+        <div style={{ fontSize: 11, color: "#9aa8c7" }}>
+          <div>Missing Appointments: <b style={{ color: "#ff7a45" }}>{orderMetrics.missingAppt}</b></div>
+          <div>Missed Appointments: <b className="bad">{apptMetrics.missed}</b></div>
+          <div>SLA Breached: <b className="bad">{orderMetrics.outOfSla}</b></div>
+        </div>
+        <a href="/dashboard/missed-appointments" style={{ fontSize: 11, color: "#5539f6", textDecoration: "none", marginTop: 6, display: "inline-block" }}>Open Exceptions →</a>
+      </Section>
+
+      {/* Activity Feed */}
+      <Section title="Recent Activity" defaultOpen={false} badge={<span style={{ fontSize: 10, color: "#64748b", marginLeft: 8 }}>Notifications & workflow</span>}>
+        <p style={{ fontSize: 11, color: "#9aa8c7" }}>View workflow actions, notifications, and status changes.</p>
+        <a href="/dashboard/activity-log" style={{ fontSize: 11, color: "#5539f6", textDecoration: "none" }}>Open Activity Log →</a>
+      </Section>
+
+      <div className="actions" style={{ marginTop: 12 }}>
         <button onClick={loadData} disabled={loading}>{loading ? "Refreshing..." : "Refresh All"}</button>
-        <span style={{ color: "#64748b", fontSize: 10 }}>{orderMetrics.total} open orders · {appointments.length} appointments</span>
-        {refreshedAt && <span style={{ fontSize: 10, color: "#64748b", marginLeft: 6 }}>Last Updated: {refreshedAt}</span>}
-        <span style={{ fontSize: 10, color: stale ? "#fb7185" : "#4ade80", marginLeft: 4 }}>{stale ? "● Stale — retrying" : "● Live (45s)"}</span>
+        <span style={{ color: "#64748b", fontSize: 10 }}>{orderMetrics.total} orders · {appointments.length} appointments · 10m refresh</span>
       </div>
 
       {/* Drawer */}
